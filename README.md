@@ -57,6 +57,56 @@ Webcam breakdown: about 32 ms camera to Python, 10 ms detection, 17 ms encode + 
 `rtpjitterbuffer` passes in-order packets straight through and only waits when one is missing,
 so on a clean link its `latency` is never used. It matters once packets are lost or reordered.
 
+## Experiments: encoders, bitrate and bad networks
+
+```bash
+.venv/bin/python -m camvision.sweep          # 20 runs, ~5 min -> results/sweep.csv
+.venv/bin/python -m camvision.plot_sweep     # -> results/*.png
+```
+
+Every run streams 300 frames of moving colour bars (`videotestsrc`, repeatable) on localhost.
+Bad networks are simulated with GStreamer's `netsim` element on the RTP packets (no root needed).
+Motion detection is off in the sender here: it alone costs about **two CPU cores** and would
+hide the encoder difference. Full data: [`results/sweep.csv`](results/sweep.csv).
+
+**Encoders.** NVENC is `nvcudah264enc` (the older `nvh264enc` fails on current NVIDIA drivers
+with *"Selected preset not supported"*).
+
+![Sender CPU](results/encoder_cpu.png)
+
+| encoder | resolution | bitrate | e2e p50 | e2e p95 | sender CPU |
+|---|---|---|---|---|---|
+| x264 | 640x480 | 0.5 / 2 / 8 Mbit/s | 24 / 24 / 28 ms | 31-33 ms | 62-67% |
+| NVENC | 640x480 | 0.5 / 2 / 8 Mbit/s | 25 / 26 / 26 ms | 28 ms | 49-51% |
+| x264 | 1920x1080 | 8 Mbit/s | 133 ms | 345 ms | 228% |
+| NVENC | 1920x1080 | 8 Mbit/s | 102 ms | 130 ms | 125% |
+
+- At 640x480, bitrate hardly changes latency and the GPU saves little. At 1080p, NVENC saves about
+  one CPU core and cuts the p95 latency from 345 ms to 130 ms.
+- At 1080p the **Python receiver becomes the bottleneck** (about 2 cores converting each frame to
+  a numpy array) and drops frames. So the 1080p numbers measure this test setup, not the network.
+
+**Jitter buffer vs network jitter** (NVENC, 2 Mbit/s; up to 30 ms random delay on half the packets):
+
+| jitter buffer | clean network | 30 ms network jitter |
+|---|---|---|
+| 0 ms | 26 ms, 100% intact | **nothing decodable (0% intact)** |
+| 50 ms | 26 ms, 100% | 51 ms, 90% |
+| 200 ms | 26 ms, 98% | 51 ms, 90% |
+
+With no jitter buffer, late packets are thrown away and every frame breaks. A larger buffer
+doesn't add latency by itself: it only waits as long as a missing packet takes to arrive.
+
+**Packet loss vs keyframe interval:**
+
+![Packet loss](results/loss_keyint.png)
+
+H.264 frames depend on earlier frames, so one lost packet damages every frame until the next
+keyframe. Even 0.5% packet loss ruins 18-45% of frames. More frequent keyframes limit the damage
+(82% intact with a keyframe every 10 frames vs 55% every 90), at the cost of more bitrate.
+Loss is random and each setting ran once, so the 2% line is noisy (the dip at 30 is not real
+structure). Real systems add FEC, retransmission (RTX) or intra-refresh instead.
+
 ## Metrics
 
 | metric | meaning |
