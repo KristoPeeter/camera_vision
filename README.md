@@ -57,6 +57,50 @@ Webcam breakdown: about 32 ms camera to Python, 10 ms detection, 17 ms encode + 
 `rtpjitterbuffer` passes in-order packets straight through and only waits when one is missing,
 so on a clean link its `latency` is never used. It matters once packets are lost or reordered.
 
+## Detections as separate metadata
+
+With `--output rtp`, the sender streams **clean video** and sends each frame's detections as a
+small JSON datagram on UDP port `--port + 1` (`camvision/meta.py`). The receiver draws them.
+
+```
+sender:   frame ─► detect ─┬─► stamp ts in pixels ─► H.264 ─► RTP  :5000 ──► decode ─► read ts ─┐
+                           └─► {"ts": ts, "boxes": [...]}  ─► UDP :5001 ──► store[ts] ──────────┴► draw boxes
+```
+
+The pixel timestamp doubles as the **frame ID**: the receiver reads it from the decoded frame
+and looks up the detections with the same `ts`. Every frame gets a message, even with zero
+detections, so "nothing detected" and "metadata missing" are different things.
+
+Why not just draw the most recently received detections? Detections skip encoding and the jitter
+buffer, so they arrive *before* their frame. Measured (300 frames each):
+
+| scenario | detections ahead of frame (p50) | matched by timestamp | "latest" would be wrong |
+|---|---|---|---|
+| clean network | 15 ms | 100% | 0.3% |
+| 30 ms network jitter | 34 ms | 100% | **48%** |
+| 1080p (slow receiver) | 216 ms | 100% | **99%** |
+
+While the video lags by less than one frame interval (33 ms), the naive approach happens to work.
+Once it lags more, boxes run ahead of the objects they belong to.
+
+With the real webcam (exposure 330 + gain, 300 frames, 95% of them with motion): 60 ms e2e p50,
+detections 16 ms ahead of their frame, 100% matched, 0 late, 0 missing.
+
+**Known limitation: one person becomes several boxes.** Background subtraction only marks pixels
+that changed, so a moving person splits into pieces wherever they look like the background (a
+dark shirt against a dark chair). One frame had 7 boxes for one person. Next steps: merge nearby
+boxes (cheap), or swap in a real object detector, such as a small YOLO model on the GPU.
+
+The receiver also reports `meta_late` (arrived after its frame was shown) and `meta_missing`
+(never arrived). Defence video systems solve the same problem with KLV metadata (MISB ST 0601)
+multiplexed into an MPEG-TS stream; H.264 SEI messages are another option.
+
+```bash
+.venv/bin/python -m camvision.receive --display              # draws the boxes it receives
+.venv/bin/python -m camvision.receive --display --no-overlay # same stream, overlays off
+.venv/bin/python -m camvision.receive --record seen.webm     # save what the operator saw
+```
+
 ## Experiments: encoders, bitrate and bad networks
 
 ```bash
