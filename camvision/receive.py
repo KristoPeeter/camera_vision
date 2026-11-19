@@ -20,13 +20,15 @@ from .pipeline import Capture, Output
 
 def summarize(rows: list[dict], unreadable: int, warmup: int = 10) -> dict:
     # Skip warm-up: the first frames wait for the first keyframe and pipeline startup.
+    total = len(rows)
     rows = rows[warmup:]
     if not rows:
-        return {"frames": 0, "unreadable_stamps": unreadable}
+        return {"frames": 0, "frames_total": total, "unreadable_stamps": unreadable}
     e2e = np.array([r["e2e_ms"] for r in rows])
     dropped, interval = estimate_drops([r["stamp_ms"] for r in rows])
     return {
         "frames": len(rows),
+        "frames_total": total,
         "unreadable_stamps": unreadable,
         "source_interval_ms": round(interval, 1),
         "lost": dropped,
@@ -43,6 +45,9 @@ def main(argv=None) -> dict:
     p.add_argument("--jitter-ms", type=int, default=50, help="rtpjitterbuffer latency")
     p.add_argument("--frames", type=int, default=-1, help="stop after N frames (-1 = until Ctrl+C)")
     p.add_argument("--display", action="store_true", help="show the received video")
+    p.add_argument("--idle-timeout", type=float, default=3.0,
+                   help="seconds without frames before assuming the stream ended (after loss the "
+                        "decoder can go silent until the next keyframe)")
     p.add_argument("--warmup", type=int, default=10, help="frames excluded from the summary")
     p.add_argument("--csv", default="receive.csv")
     p.add_argument("--width", type=int, default=640)
@@ -63,13 +68,17 @@ def main(argv=None) -> dict:
     signal.signal(signal.SIGINT, _on_sigint)
     print(f"pipeline: {cap.description}\nwaiting for stream on UDP port {args.port}...")
     cap.start()
+    started = False
+    idle = 0.0
     try:
         while not stop and (args.frames < 0 or len(rows) < args.frames):
             frame = cap.read(timeout_s=0.5)
             if frame is None:
-                if rows:          # stream stopped after it had started
-                    break
-                continue          # sender not running yet
+                idle += 0.5
+                if started and idle >= args.idle_timeout:
+                    break         # stream stopped after it had started
+                continue          # sender not running yet, or a gap after packet loss
+            started, idle = True, 0.0
             stamp = timestamp.read(frame.image)
             if stamp is None:
                 unreadable += 1
