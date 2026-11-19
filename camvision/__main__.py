@@ -24,7 +24,12 @@ def main(argv=None) -> dict:
     p.add_argument("--out-path", default="out.webm")
     p.add_argument("--host", default="127.0.0.1", help="rtp: receiver address")
     p.add_argument("--port", type=int, default=5000, help="rtp: receiver UDP port")
-    p.add_argument("--encoder", default="x264", help="rtp: H.264 encoder")
+    p.add_argument("--encoder", choices=["x264", "nvenc"], default="x264",
+                   help="rtp: H.264 encoder (x264 = CPU, nvenc = NVIDIA GPU)")
+    p.add_argument("--net-loss", type=float, default=0, help="rtp: simulated packet loss %%")
+    p.add_argument("--net-jitter", type=int, default=0, help="rtp: simulated jitter, max ms")
+    p.add_argument("--pattern", default="pattern=ball",
+                   help='test source: videotestsrc properties, e.g. "pattern=smpte horizontal-speed=4"')
     p.add_argument("--bitrate", type=int, default=2000, help="rtp: kbit/s")
     p.add_argument("--key-int", type=int, default=30, help="rtp: frames between keyframes")
     p.add_argument("--csv", default="metrics.csv")
@@ -32,17 +37,20 @@ def main(argv=None) -> dict:
                    help="webcam manual exposure in 100us units (e.g. 150 = 15 ms); default auto")
     p.add_argument("--gain", action="store_true",
                    help="auto digital gain in OpenCV (pair with a short --exposure in low light)")
+    p.add_argument("--no-detect", action="store_true",
+                   help="skip motion detection (e.g. to measure encoder CPU cost alone)")
     p.add_argument("--min-area", type=int, default=500)
     args = p.parse_args(argv)
 
     cap = Capture(args.source, args.device, args.width, args.height, args.fps,
-                  num_buffers=args.frames if args.source == "test" else -1, exposure=args.exposure)
+                  num_buffers=args.frames if args.source == "test" else -1, exposure=args.exposure,
+                  pattern=args.pattern)
     det = MotionDetector(min_area=args.min_area)
     metrics = Metrics()
     out = None if args.output == "none" else Output(
         args.output, args.width, args.height, args.fps, args.out_path,
         host=args.host, port=args.port, encoder=args.encoder, bitrate=args.bitrate,
-        key_int=args.key_int)
+        key_int=args.key_int, loss_pct=args.net_loss, jitter_ms=args.net_jitter)
     stop = False
 
     def _on_sigint(*_):
@@ -62,7 +70,7 @@ def main(argv=None) -> dict:
             gain = 1.0
             if args.gain:
                 frame.image, gain = auto_gain(frame.image)
-            boxes = det.detect(frame.image)
+            boxes = [] if args.no_detect else det.detect(frame.image)
             proc = time.perf_counter() - t
             metrics.record(frame.pts_ns, frame.latency_ns, proc, len(boxes))
             if out:
