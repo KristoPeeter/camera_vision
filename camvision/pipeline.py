@@ -24,7 +24,7 @@ SOURCES = {
     "webcam": "v4l2src device={device} {controls} ! image/jpeg,width={width},height={height},framerate={fps}/1 "
               "! jpegdec",
     # Synthetic moving ball - handy without a camera, and deterministic for tests.
-    "test": "videotestsrc pattern=ball is-live=true num-buffers={num_buffers} "
+    "test": "videotestsrc {pattern} is-live=true num-buffers={num_buffers} "
             "! video/x-raw,width={width},height={height},framerate={fps}/1",
     "file": "filesrc location={device} ! decodebin ! videoconvert ! videoscale "
             "! video/x-raw,width={width},height={height}",
@@ -47,7 +47,8 @@ class Frame:
 class Capture:
     def __init__(self, source: str = "test", device: str = "/dev/video0",
                  width: int = 640, height: int = 480, fps: int = 30, num_buffers: int = -1,
-                 exposure: int | None = None, port: int = 5000, jitter_ms: int = 50):
+                 exposure: int | None = None, port: int = 5000, jitter_ms: int = 50,
+                 pattern: str = "pattern=ball"):
         # exposure: manual exposure in 100us units (V4L2 exposure_time_absolute). None = auto.
         # In low light, auto-exposure lengthens exposure and silently lowers the frame rate:
         # frame period >= exposure, so 30 fps allows at most ~330 (33 ms).
@@ -58,7 +59,7 @@ class Capture:
         controls = f'extra-controls="c,{ae},brightness=0,contrast=50,gamma=300"'
         src = SOURCES[source].format(device=device, width=width, height=height, fps=fps,
                                      num_buffers=num_buffers, controls=controls,
-                                     port=port, jitter_ms=jitter_ms)
+                                     port=port, jitter_ms=jitter_ms, pattern=pattern)
         # max-buffers=1 drop=true: always hand us the newest frame (low latency over completeness)
         desc = (f"{src} ! videoconvert ! video/x-raw,format=BGR "
                 f"! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false")
@@ -109,6 +110,10 @@ class Capture:
 ENCODERS = {
     # zerolatency: no B-frames, no lookahead, sliced threads -> each frame leaves immediately
     "x264": "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={key_int}",
+    # NVENC on the GPU. nvcudah264enc is the newer element: the older nvh264enc fails on
+    # current drivers with "Selected preset not supported" (legacy presets were removed).
+    "nvenc": "nvcudah264enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true "
+             "rate-control=cbr bitrate={bitrate} gop-size={key_int}",
 }
 
 
@@ -117,15 +122,21 @@ class Output:
 
     def __init__(self, kind: str, width: int, height: int, fps: int, path: str = "out.webm",
                  host: str = "127.0.0.1", port: int = 5000, encoder: str = "x264",
-                 bitrate: int = 2000, key_int: int = 30):
+                 bitrate: int = 2000, key_int: int = 30, loss_pct: float = 0, jitter_ms: int = 0):
         caps = f"video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1"
         enc = ENCODERS[encoder].format(bitrate=bitrate, key_int=key_int)
+        # Optional bad-network simulation on the RTP packets, no root/tc needed:
+        # drop loss_pct% of packets, and delay 50% of packets by 0..jitter_ms (causes reordering).
+        net = ""
+        if loss_pct or jitter_ms:
+            net = (f"netsim drop-probability={loss_pct / 100} delay-probability={0.5 if jitter_ms else 0} "
+                   f"min-delay=0 max-delay={jitter_ms} allow-reordering=true ! ")
         sinks = {
             "display": "videoconvert ! autovideosink sync=false",
             "file": f"videoconvert ! vp8enc deadline=1 ! webmmux ! filesink location={path}",
             # config-interval=-1 resends SPS/PPS with every keyframe, so a receiver can join late
-            "rtp": f"videoconvert ! video/x-raw,format=I420 ! {enc} ! h264parse "
-                   f"! rtph264pay config-interval=-1 pt=96 ! udpsink host={host} port={port} sync=false",
+            "rtp": f"videoconvert ! {enc} ! h264parse "
+                   f"! rtph264pay config-interval=-1 pt=96 ! {net}udpsink host={host} port={port} sync=false",
         }
         self.pipeline = Gst.parse_launch(
             f"appsrc name=src is-live=true format=time caps={caps} ! {sinks[kind]}")
