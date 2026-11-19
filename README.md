@@ -25,6 +25,38 @@ python3 -m venv --system-site-packages .venv      # system site-packages for GSt
 .venv/bin/python -m pytest -q
 ```
 
+## Streaming over RTP/UDP
+
+```
+camera ─► detect ─► stamp capture time ─► x264 (zerolatency) ─► RTP ─► UDP
+                         into pixels                                      │
+             receiver: UDP ─► jitter buffer ─► H.264 decode ─► read stamp ─► end-to-end latency
+```
+
+```bash
+.venv/bin/python -m camvision.receive --display                                   # terminal 1
+.venv/bin/python -m camvision --source webcam --exposure 330 --gain --output rtp --frames -1   # terminal 2
+```
+
+The capture time is written into each frame as 40 black/white 16x16 blocks (bottom-left),
+aligned to H.264 macroblocks and protected by a checksum (`camvision/timestamp.py`). Because it
+travels inside the picture, the receiver measures the whole path: capture, processing,
+encoding, network and decoding. It does not include the display itself.
+Sender and receiver must share a clock (same machine, or NTP-synced machines).
+
+First results (same machine, 640x480 at 30 fps, x264 at 2 Mbit/s, first 10 frames skipped):
+
+| source | e2e p50 | e2e p95 | lost |
+|---|---|---|---|
+| synthetic (`videotestsrc`) | 24 ms | 34 ms | 0 |
+| webcam, exposure 330 + gain | 59 ms | 70 ms | 0 |
+
+Webcam breakdown: about 32 ms camera to Python, 10 ms detection, 17 ms encode + network + decode.
+
+**The jitter buffer setting didn't change latency here** (0, 50 and 500 ms all gave about 24 ms).
+`rtpjitterbuffer` passes in-order packets straight through and only waits when one is missing,
+so on a clean link its `latency` is never used. It matters once packets are lost or reordered.
+
 ## Metrics
 
 | metric | meaning |
