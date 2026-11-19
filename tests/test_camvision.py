@@ -66,3 +66,24 @@ def test_auto_gain_brightens_dark_frame_and_leaves_bright_alone():
     bright = np.full((100, 100, 3), 230, np.uint8)
     out, g = auto_gain(bright)
     assert g == 1.0 and out is bright
+
+
+def test_timestamp_roundtrip_survives_jpeg_compression():
+    import cv2
+    from camvision import timestamp
+    img = np.random.default_rng(0).integers(0, 256, (480, 640, 3), np.uint8)
+    ms = 1_763_560_000_123
+    timestamp.stamp(img, ms)
+    ok, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 30])
+    assert timestamp.read(cv2.imdecode(enc, cv2.IMREAD_COLOR)) == ms & 0xFFFFFFFF
+
+
+def test_timestamp_rejects_unstamped_frames():
+    from camvision import timestamp
+    assert timestamp.read(np.zeros((480, 640, 3), np.uint8)) is None
+    assert timestamp.read(np.full((480, 640, 3), 255, np.uint8)) is None
+
+
+def test_timestamp_age_handles_wraparound():
+    from camvision import timestamp
+    assert timestamp.age_ms(0xFFFFFFF0, now=0x1_0000_0010) == 0x20
