@@ -23,9 +23,11 @@ class MotionDetector:
         return [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= self.min_area]
 
 
-def annotate(img: np.ndarray, boxes, hud: str) -> np.ndarray:
+def annotate(img: np.ndarray, boxes, hud: str | None) -> np.ndarray:
     for x, y, w, h in boxes:
         cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+    if hud is None:
+        return img
     cv2.rectangle(img, (0, 0), (img.shape[1], 24), (0, 0, 0), -1)
     cv2.putText(img, hud, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return img
