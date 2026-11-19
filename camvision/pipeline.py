@@ -33,6 +33,8 @@ SOURCES = {
     "rtp": "udpsrc port={port} caps=\"application/x-rtp,media=video,encoding-name=H264,"
            "clock-rate=90000,payload=96\" ! rtpjitterbuffer latency={jitter_ms} "
            "! rtph264depay ! h264parse ! avdec_h264",
+    # Pull from an RTSP server (an IP camera, or our own --output rtsp).
+    "rtsp": "rtspsrc location={url} latency={jitter_ms} ! rtph264depay ! h264parse ! avdec_h264",
 }
 
 
@@ -48,7 +50,7 @@ class Capture:
     def __init__(self, source: str = "test", device: str = "/dev/video0",
                  width: int = 640, height: int = 480, fps: int = 30, num_buffers: int = -1,
                  exposure: int | None = None, port: int = 5000, jitter_ms: int = 50,
-                 pattern: str = "pattern=ball"):
+                 pattern: str = "pattern=ball", url: str = ""):
         # exposure: manual exposure in 100us units (V4L2 exposure_time_absolute). None = auto.
         # In low light, auto-exposure lengthens exposure and silently lowers the frame rate:
         # frame period >= exposure, so 30 fps allows at most ~330 (33 ms).
@@ -59,7 +61,7 @@ class Capture:
         controls = f'extra-controls="c,{ae},brightness=0,contrast=50,gamma=300"'
         src = SOURCES[source].format(device=device, width=width, height=height, fps=fps,
                                      num_buffers=num_buffers, controls=controls,
-                                     port=port, jitter_ms=jitter_ms, pattern=pattern)
+                                     port=port, jitter_ms=jitter_ms, pattern=pattern, url=url)
         # max-buffers=1 drop=true: always hand us the newest frame (low latency over completeness)
         desc = (f"{src} ! videoconvert ! video/x-raw,format=BGR "
                 f"! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false")
@@ -109,10 +111,12 @@ class Capture:
 # H.264 encoders tuned for latency. bitrate in kbit/s, key_int = frames between keyframes.
 ENCODERS = {
     # zerolatency: no B-frames, no lookahead, sliced threads -> each frame leaves immediately
-    "x264": "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={key_int}",
+    # Each encoder pinned to 4:2:0 input. Left free, videoconvert may pick 4:4:4, which the
+    # baseline profile that RTSP/phone players ask for doesn't support.
+    "x264": "video/x-raw,format=I420 ! x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={key_int}",
     # NVENC on the GPU. nvcudah264enc is the newer element: the older nvh264enc fails on
     # current drivers with "Selected preset not supported" (legacy presets were removed).
-    "nvenc": "nvcudah264enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true "
+    "nvenc": "video/x-raw,format=NV12 ! nvcudah264enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true "
              "rate-control=cbr bitrate={bitrate} gop-size={key_int}",
 }
 
@@ -158,3 +162,64 @@ class Output:
         self.pipeline.get_bus().timed_pop_filtered(5 * Gst.SECOND,
                                                     Gst.MessageType.EOS | Gst.MessageType.ERROR)
         self.pipeline.set_state(Gst.State.NULL)
+
+
+class RtspOutput:
+    """Serve the stream as rtsp://<address>:<port><mount>, the way IP cameras do.
+
+    One shared pipeline: every client (VLC, ffplay, the receiver) gets the same encoded
+    stream, so the encoder runs once no matter how many viewers connect. Frames are only
+    pushed while at least one client is connected.
+    """
+
+    def __init__(self, width: int, height: int, fps: int, encoder: str = "x264",
+                 bitrate: int = 2000, key_int: int = 30, address: str = "127.0.0.1",
+                 port: int = 8554, mount: str = "/cam", tcp_only: bool = False):
+        import threading
+
+        gi.require_version("GstRtspServer", "1.0")
+        from gi.repository import GLib, GstRtspServer
+
+        caps = f"video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1"
+        enc = ENCODERS[encoder].format(bitrate=bitrate, key_int=key_int)
+        factory = GstRtspServer.RTSPMediaFactory()
+        # do-timestamp: appsrc stamps each buffer with the pipeline clock when we push it
+        factory.set_launch(f"( appsrc name=src is-live=true format=time do-timestamp=true "
+                           f"caps={caps} ! videoconvert ! {enc} ! h264parse "
+                           f"! rtph264pay name=pay0 pt=96 config-interval=-1 )")
+        factory.set_shared(True)
+        if tcp_only:
+            # Send video inside the RTSP TCP connection (port 8554) instead of separate UDP
+            # ports: works through firewalls/NAT with no client settings, at the cost of
+            # head-of-line blocking (a lost packet delays everything behind it).
+            gi.require_version("GstRtsp", "1.0")
+            from gi.repository import GstRtsp
+            factory.set_protocols(GstRtsp.RTSPLowerTrans.TCP)
+        factory.connect("media-configure", self._on_media_configure)
+
+        self.server = GstRtspServer.RTSPServer()
+        self.server.set_address(address)
+        self.server.set_service(str(port))
+        self.server.get_mount_points().add_factory(mount, factory)
+        if self.server.attach(None) == 0:
+            raise RuntimeError(f"RTSP server could not listen on {address}:{port}")
+        self.url = f"rtsp://{address}:{port}{mount}"
+        self.appsrc = None
+        self.loop = GLib.MainLoop()
+        threading.Thread(target=self.loop.run, daemon=True).start()   # serves clients
+
+    def _on_media_configure(self, factory, media) -> None:
+        self.appsrc = media.get_element().get_child_by_name("src")
+        media.connect("unprepared", lambda *_: setattr(self, "appsrc", None))  # last client left
+
+    @property
+    def clients(self) -> bool:
+        return self.appsrc is not None
+
+    def push(self, img: np.ndarray) -> None:
+        src = self.appsrc
+        if src is not None:
+            src.emit("push-buffer", Gst.Buffer.new_wrapped(img.tobytes()))
+
+    def close(self) -> None:
+        self.loop.quit()
