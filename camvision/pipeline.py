@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import time
+
 import gi
 import numpy as np
 
@@ -26,6 +28,11 @@ SOURCES = {
             "! video/x-raw,width={width},height={height},framerate={fps}/1",
     "file": "filesrc location={device} ! decodebin ! videoconvert ! videoscale "
             "! video/x-raw,width={width},height={height}",
+    # Receive H.264 over RTP/UDP. The jitter buffer reorders packets and absorbs network
+    # jitter, but it holds every frame for `latency` ms - a direct latency/robustness trade-off.
+    "rtp": "udpsrc port={port} caps=\"application/x-rtp,media=video,encoding-name=H264,"
+           "clock-rate=90000,payload=96\" ! rtpjitterbuffer latency={jitter_ms} "
+           "! rtph264depay ! h264parse ! avdec_h264",
 }
 
 
@@ -34,12 +41,13 @@ class Frame:
     image: np.ndarray       # HxWx3 BGR
     pts_ns: int             # buffer presentation timestamp (pipeline running time)
     latency_ns: int         # pipeline clock "now" minus PTS when we received it
+    capture_wall_ms: int    # wall-clock time of capture (now - latency), for end-to-end stamps
 
 
 class Capture:
     def __init__(self, source: str = "test", device: str = "/dev/video0",
                  width: int = 640, height: int = 480, fps: int = 30, num_buffers: int = -1,
-                 exposure: int | None = None):
+                 exposure: int | None = None, port: int = 5000, jitter_ms: int = 50):
         # exposure: manual exposure in 100us units (V4L2 exposure_time_absolute). None = auto.
         # In low light, auto-exposure lengthens exposure and silently lowers the frame rate:
         # frame period >= exposure, so 30 fps allows at most ~330 (33 ms).
@@ -49,7 +57,8 @@ class Capture:
             f"auto_exposure=1,exposure_time_absolute={exposure}"
         controls = f'extra-controls="c,{ae},brightness=0,contrast=50,gamma=300"'
         src = SOURCES[source].format(device=device, width=width, height=height, fps=fps,
-                                     num_buffers=num_buffers, controls=controls)
+                                     num_buffers=num_buffers, controls=controls,
+                                     port=port, jitter_ms=jitter_ms)
         # max-buffers=1 drop=true: always hand us the newest frame (low latency over completeness)
         desc = (f"{src} ! videoconvert ! video/x-raw,format=BGR "
                 f"! appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false")
@@ -84,7 +93,7 @@ class Capture:
         if clock is not None and buf.pts != Gst.CLOCK_TIME_NONE:
             running_time = clock.get_time() - self.pipeline.get_base_time()
             latency = max(0, running_time - buf.pts)
-        return Frame(img, buf.pts, latency)
+        return Frame(img, buf.pts, latency, (time.time_ns() - latency) // 1_000_000)
 
     def _raise_on_error(self) -> None:
         msg = self.pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
@@ -96,14 +105,27 @@ class Capture:
         self.pipeline.set_state(Gst.State.NULL)
 
 
-class Output:
-    """Push BGR frames into a GStreamer sink: on-screen window or a WebM file."""
+# H.264 encoders tuned for latency. bitrate in kbit/s, key_int = frames between keyframes.
+ENCODERS = {
+    # zerolatency: no B-frames, no lookahead, sliced threads -> each frame leaves immediately
+    "x264": "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max={key_int}",
+}
 
-    def __init__(self, kind: str, width: int, height: int, fps: int, path: str = "out.webm"):
+
+class Output:
+    """Push BGR frames into a GStreamer sink: on-screen window, WebM file or RTP/UDP stream."""
+
+    def __init__(self, kind: str, width: int, height: int, fps: int, path: str = "out.webm",
+                 host: str = "127.0.0.1", port: int = 5000, encoder: str = "x264",
+                 bitrate: int = 2000, key_int: int = 30):
         caps = f"video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1"
+        enc = ENCODERS[encoder].format(bitrate=bitrate, key_int=key_int)
         sinks = {
             "display": "videoconvert ! autovideosink sync=false",
             "file": f"videoconvert ! vp8enc deadline=1 ! webmmux ! filesink location={path}",
+            # config-interval=-1 resends SPS/PPS with every keyframe, so a receiver can join late
+            "rtp": f"videoconvert ! video/x-raw,format=I420 ! {enc} ! h264parse "
+                   f"! rtph264pay config-interval=-1 pt=96 ! udpsink host={host} port={port} sync=false",
         }
         self.pipeline = Gst.parse_launch(
             f"appsrc name=src is-live=true format=time caps={caps} ! {sinks[kind]}")

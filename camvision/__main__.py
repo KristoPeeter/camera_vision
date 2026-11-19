@@ -7,6 +7,7 @@ import signal
 import time
 
 from .detector import MotionDetector, annotate, auto_gain
+from . import timestamp
 from .metrics import Metrics
 from .pipeline import Capture, Output
 
@@ -19,8 +20,13 @@ def main(argv=None) -> dict:
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--frames", type=int, default=300, help="stop after N frames (-1 = forever)")
-    p.add_argument("--output", choices=["none", "display", "file"], default="none")
+    p.add_argument("--output", choices=["none", "display", "file", "rtp"], default="none")
     p.add_argument("--out-path", default="out.webm")
+    p.add_argument("--host", default="127.0.0.1", help="rtp: receiver address")
+    p.add_argument("--port", type=int, default=5000, help="rtp: receiver UDP port")
+    p.add_argument("--encoder", default="x264", help="rtp: H.264 encoder")
+    p.add_argument("--bitrate", type=int, default=2000, help="rtp: kbit/s")
+    p.add_argument("--key-int", type=int, default=30, help="rtp: frames between keyframes")
     p.add_argument("--csv", default="metrics.csv")
     p.add_argument("--exposure", type=int, default=None,
                    help="webcam manual exposure in 100us units (e.g. 150 = 15 ms); default auto")
@@ -33,8 +39,10 @@ def main(argv=None) -> dict:
                   num_buffers=args.frames if args.source == "test" else -1, exposure=args.exposure)
     det = MotionDetector(min_area=args.min_area)
     metrics = Metrics()
-    out = None if args.output == "none" else Output(args.output, args.width, args.height,
-                                                     args.fps, args.out_path)
+    out = None if args.output == "none" else Output(
+        args.output, args.width, args.height, args.fps, args.out_path,
+        host=args.host, port=args.port, encoder=args.encoder, bitrate=args.bitrate,
+        key_int=args.key_int)
     stop = False
 
     def _on_sigint(*_):
@@ -60,7 +68,8 @@ def main(argv=None) -> dict:
             if out:
                 hud = (f"{metrics.live_fps():5.1f} fps | lat {frame.latency_ns / 1e6:5.1f} ms | "
                        f"proc {proc * 1e3:4.1f} ms | gain x{gain:.1f} | objs {len(boxes)}")
-                out.push(annotate(frame.image, boxes, hud))
+                img = annotate(frame.image, boxes, hud)
+                out.push(timestamp.stamp(img, frame.capture_wall_ms))
     finally:
         cap.stop()
         if out:
