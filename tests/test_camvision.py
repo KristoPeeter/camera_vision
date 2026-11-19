@@ -87,3 +87,24 @@ def test_timestamp_rejects_unstamped_frames():
 def test_timestamp_age_handles_wraparound():
     from camvision import timestamp
     assert timestamp.age_ms(0xFFFFFFF0, now=0x1_0000_0010) == 0x20
+
+
+def test_metadata_roundtrip_and_lookup_by_timestamp():
+    import time
+    from camvision.meta import MetaReceiver, MetaSender
+    rx = MetaReceiver(port=5799)
+    tx = MetaSender("127.0.0.1", 5799)
+    try:
+        tx.send(1_763_560_000_123, [(10, 20, 30, 40)], proc_ms=5.0)
+        tx.send(1_763_560_000_156, [])                       # a frame with no detections
+        for _ in range(50):
+            if rx.received == 2:
+                break
+            time.sleep(0.01)
+        msg, _ = rx.lookup(1_763_560_000_123)
+        assert msg["boxes"] == [[10, 20, 30, 40]] and msg["proc_ms"] == 5.0
+        assert rx.lookup(1_763_560_000_156)[0]["boxes"] == []  # known: zero objects
+        assert rx.lookup(1_763_560_000_189) is None            # unknown: never sent
+    finally:
+        tx.close()
+        rx.close()
