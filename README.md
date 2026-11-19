@@ -101,6 +101,47 @@ multiplexed into an MPEG-TS stream; H.264 SEI messages are another option.
 .venv/bin/python -m camvision.receive --record seen.webm     # save what the operator saw
 ```
 
+## RTSP server: watch from VLC or a phone
+
+`--output rtsp` serves the stream the way IP cameras do (`GstRtspServer`). Viewers connect to
+a URL and all share one encoder, so the cost doesn't grow with the number of viewers.
+
+```bash
+# this machine only (default)
+.venv/bin/python -m camvision --source webcam --exposure 330 --gain --output rtsp --frames -1
+.venv/bin/python -m camvision.receive --url rtsp://127.0.0.1:8554/cam --display
+
+# visible on your network, e.g. VLC on a phone: Open Network Stream -> the printed URL
+.venv/bin/python -m camvision --source webcam --exposure 330 --gain --output rtsp \
+    --rtsp-address 0.0.0.0 --burn-boxes --rtsp-tcp --frames -1
+```
+
+- **Security:** the server listens on `127.0.0.1` by default. With `0.0.0.0`, anyone on your
+  network can watch the camera. There is no password and no encryption, so don't use it on
+  public networks.
+- **`--burn-boxes`:** VLC and phones don't know about our detection metadata, so this draws the
+  boxes into the video for them. The metadata is still sent too.
+- Measured (synthetic source, x264): 24 ms e2e p50 through RTSP on localhost. Over the LAN
+  address, two clients at once: 26 ms each, with one encoder.
+- **`--rtsp-tcp`:** by default RTSP only sets up the session over TCP port 8554 and sends the
+  video over separate UDP ports, which firewalls often block. With `--rtsp-tcp` the video goes
+  inside the TCP connection, so phones work without changing any client settings. It's slower:
+  58 ms vs 26 ms e2e on the LAN, because TCP holds small packets briefly to batch them and one
+  lost packet stalls everything behind it.
+- **Phone can't connect?** Check the address character by character: `rtsp://<ip>:8554/cam`
+  needs a *colon* before the port. With a dot (`192.168.1.50.8554`) the phone treats it as a
+  hostname, does a DNS lookup and fails (`DNS_PROBE_FINISHED_NXDOMAIN` in Chrome, "media cannot be
+  played" in VLC) without sending a single packet to the server. Debugging it: `ss -tn | grep 8554`
+  on the server shows live clients, and `sudo tcpdump -ni <wifi-if> host <phone-ip> and tcp` shows
+  whether the phone even tries to connect.
+- **Pixel format pitfall:** inside the RTSP server, `videoconvert` picked 4:4:4 and x264 failed
+  with *"baseline profile doesn't support 4:4:4"*. Each encoder is now pinned to 4:2:0
+  (I420 for x264, NV12 for NVENC).
+- **Open question: NVENC over RTSP is ~25 ms slower than x264** (49 vs 24 ms), but not over plain RTP
+  (23 ms). It doesn't depend on the receiver's jitter buffer (0/50/200 ms all the same), and
+  probes inside the server show the encoder output only ~4 ms behind x264. So the extra time is
+  added after the server's payloader, in its network sink or in the receiver. Not solved yet.
+
 ## Experiments: encoders, bitrate and bad networks
 
 ```bash
