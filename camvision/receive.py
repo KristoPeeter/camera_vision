@@ -62,6 +62,7 @@ def _meta_summary(rows: list[dict], meta: MetaReceiver) -> dict:
 def main(argv=None) -> dict:
     p = argparse.ArgumentParser(description="RTP/H.264 receiver with end-to-end latency metrics")
     p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--url", help="pull from an RTSP server instead, e.g. rtsp://127.0.0.1:8554/cam")
     p.add_argument("--jitter-ms", type=int, default=50, help="rtpjitterbuffer latency")
     p.add_argument("--frames", type=int, default=-1, help="stop after N frames (-1 = until Ctrl+C)")
     p.add_argument("--display", action="store_true", help="show the received video")
@@ -79,8 +80,8 @@ def main(argv=None) -> dict:
     p.add_argument("--height", type=int, default=480)
     args = p.parse_args(argv)
 
-    cap = Capture("rtp", port=args.port, jitter_ms=args.jitter_ms,
-                  width=args.width, height=args.height)
+    cap = Capture("rtsp" if args.url else "rtp", port=args.port, jitter_ms=args.jitter_ms,
+                  width=args.width, height=args.height, url=args.url or "")
     out = None
     if args.display:
         out = Output("display", args.width, args.height, 30)
@@ -96,7 +97,8 @@ def main(argv=None) -> dict:
         stop = True
 
     signal.signal(signal.SIGINT, _on_sigint)
-    print(f"pipeline: {cap.description}\nwaiting for stream on UDP port {args.port}...")
+    print(f"pipeline: {cap.description}\nwaiting for stream on "
+          f"{args.url or f'UDP port {args.port}'}...")
     cap.start()
     started = False
     idle = 0.0
