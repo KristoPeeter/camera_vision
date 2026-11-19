@@ -8,6 +8,7 @@ import time
 
 from .detector import MotionDetector, annotate, auto_gain
 from . import timestamp
+from .meta import MetaSender
 from .metrics import Metrics
 from .pipeline import Capture, Output
 
@@ -24,6 +25,8 @@ def main(argv=None) -> dict:
     p.add_argument("--out-path", default="out.webm")
     p.add_argument("--host", default="127.0.0.1", help="rtp: receiver address")
     p.add_argument("--port", type=int, default=5000, help="rtp: receiver UDP port")
+    p.add_argument("--meta-port", type=int, default=None,
+                   help="rtp: UDP port for detection metadata (default: --port + 1)")
     p.add_argument("--encoder", choices=["x264", "nvenc"], default="x264",
                    help="rtp: H.264 encoder (x264 = CPU, nvenc = NVIDIA GPU)")
     p.add_argument("--net-loss", type=float, default=0, help="rtp: simulated packet loss %%")
@@ -51,6 +54,10 @@ def main(argv=None) -> dict:
         args.output, args.width, args.height, args.fps, args.out_path,
         host=args.host, port=args.port, encoder=args.encoder, bitrate=args.bitrate,
         key_int=args.key_int, loss_pct=args.net_loss, jitter_ms=args.net_jitter)
+    # With rtp, video goes out clean and detections travel separately as metadata.
+    meta = None
+    if args.output == "rtp":
+        meta = MetaSender(args.host, args.meta_port or args.port + 1)
     stop = False
 
     def _on_sigint(*_):
@@ -73,7 +80,11 @@ def main(argv=None) -> dict:
             boxes = [] if args.no_detect else det.detect(frame.image)
             proc = time.perf_counter() - t
             metrics.record(frame.pts_ns, frame.latency_ns, proc, len(boxes))
-            if out:
+            if meta:
+                meta.send(frame.capture_wall_ms, boxes, proc_ms=round(proc * 1e3, 1),
+                          gain=round(gain, 2))
+                out.push(timestamp.stamp(frame.image, frame.capture_wall_ms))
+            elif out:
                 hud = (f"{metrics.live_fps():5.1f} fps | lat {frame.latency_ns / 1e6:5.1f} ms | "
                        f"proc {proc * 1e3:4.1f} ms | gain x{gain:.1f} | objs {len(boxes)}")
                 img = annotate(frame.image, boxes, hud)
@@ -82,6 +93,8 @@ def main(argv=None) -> dict:
         cap.stop()
         if out:
             out.close()
+        if meta:
+            meta.close()
 
     metrics.to_csv(args.csv)
     s = metrics.summary()
